@@ -1,6 +1,5 @@
 fastapi
 uvicorn[standard]
-sqlalchemy
+sqlalchemy>=2.0
 psycopg[binary]
-pydantic
 httpx
