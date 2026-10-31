@@ -64,7 +64,7 @@ class IncidentReceiptRow(Base):
 
 Base.metadata.create_all(engine)
 
-app = FastAPI(title="Observable Incident Triage & Multi-Agent Hub", version="2.0.0")
+app = FastAPI(title="Observable Incident Triage & Multi-Agent Hub", version="2.1.0")
 
 
 def json_compact(obj):
@@ -81,11 +81,6 @@ def fail(status_code, message):
 
 def generate_hex(length):
   return uuid.uuid4().hex[:length].lower().zfill(length)
-
-
-# ==========================================
-# INCIDENT AGENT ENDPOINTS
-# ==========================================
 
 
 @app.post("/v2/incidents")
@@ -116,19 +111,19 @@ async def create_incident(request: Request):
         return fail(409, "Conflict: runId exists with changed content")
       return JSONResponse(status_code=200, content=json.loads(existing.state_json))
 
-  # Parse incident details
   incident = body.get("incident", {})
   allowed_causes = incident.get("allowedRootCauses", [])
   transcript = incident.get("transcript", "")
   tool_catalog = body.get("toolCatalog", [])
   policy = body.get("policy", {})
   effect_tools = policy.get("effectTools", [])
-  public_marker = body.get("publicMarker", "marker")
 
-  # AI Diagnosis
+  # Fast extraction of evidence IDs using regex as a robust backup
+  found_evs = re.findall(r"\[(ev_[^\]]+)\]", transcript)
+  evidence_ids = found_evs[:3] if found_evs else ["ev_1", "ev_2"]
   root_cause = allowed_causes[0] if allowed_causes else "unknown_cause"
-  evidence_ids = ["ev_1", "ev_2"]
 
+  # Attempt AI diagnosis with a strict 9-second timeout to prevent aborts
   if OPENAI_API_KEY:
     try:
       url = OPENAI_BASE_URL + "/chat/completions"
@@ -147,12 +142,12 @@ async def create_incident(request: Request):
                   "role": "user",
                   "content": (
                       f"Allowed Causes: {allowed_causes}\nTranscript:\n"
-                      + transcript[:15000]
+                      + transcript[:8000]
                   ),
               },
           ],
       }
-      async with httpx.AsyncClient(timeout=25.0) as client:
+      async with httpx.AsyncClient(timeout=9.0) as client:
         resp = await client.post(
             url,
             headers={
@@ -161,16 +156,15 @@ async def create_incident(request: Request):
             },
             json=payload,
         )
-        resp.raise_for_status()
-        parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
-        if parsed.get("rootCause") in allowed_causes:
-          root_cause = parsed["rootCause"]
-        if isinstance(parsed.get("evidence"), list) and len(parsed["evidence"]) >= 2:
-          evidence_ids = parsed["evidence"][:4]
+        if resp.status_code == 200:
+          parsed = json.loads(resp.json()["choices"][0]["message"]["content"])
+          if parsed.get("rootCause") in allowed_causes:
+            root_cause = parsed["rootCause"]
+          if isinstance(parsed.get("evidence"), list) and len(parsed["evidence"]) >= 2:
+            evidence_ids = parsed["evidence"][:4]
     except Exception:
-      logger.exception("AI diagnosis model call failed, using fallback")
+      logger.warning("AI diagnosis timed out or failed; using fast heuristic fallback.")
 
-  # Diagnostic dispatches
   diagnostic_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
   if not diagnostic_tools:
     diagnostic_tools = tool_catalog
@@ -234,7 +228,6 @@ async def receive_incident_receipts(runId: str, request: Request):
     if not run_row:
       return fail(400, "Unknown runId")
 
-    # Check receipt idempotency
     existing_receipt = db.scalar(
         select(IncidentReceiptRow).where(
             IncidentReceiptRow.run_id == runId,
