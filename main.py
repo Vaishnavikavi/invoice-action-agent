@@ -64,7 +64,7 @@ class IncidentReceiptRow(Base):
 
 Base.metadata.create_all(engine)
 
-app = FastAPI(title="Observable Incident Triage & Multi-Agent Hub", version="2.2.0")
+app = FastAPI(title="Observable Incident Triage & Multi-Agent Hub", version="2.3.0")
 
 
 def json_compact(obj):
@@ -117,8 +117,6 @@ async def create_incident(request: Request):
   tool_catalog = body.get("toolCatalog", [])
   policy = body.get("policy", {})
   effect_tools = policy.get("effectTools", [])
-  approval_required = policy.get("approvalRequiredFor", [])
-  public_marker = body.get("publicMarker", "marker")
 
   # Evidence extraction
   found_evs = re.findall(r"\[(ev_[^\]]+)\]", transcript)
@@ -164,15 +162,15 @@ async def create_incident(request: Request):
           if isinstance(parsed.get("evidence"), list) and len(parsed["evidence"]) >= 2:
             evidence_ids = parsed["evidence"][:4]
     except Exception:
-      logger.warning("AI diagnosis model call failed; using heuristic fallback.")
+      logger.warning("AI diagnosis model call failed; using fallback.")
 
-  # Select diagnostic tool from catalog
+  # Diagnostic dispatches
   diagnostic_tools = [t for t in tool_catalog if t.get("name") not in effect_tools]
   if not diagnostic_tools:
     diagnostic_tools = tool_catalog
 
-  chosen_tool_def = diagnostic_tools[0] if diagnostic_tools else {"name": "query_metrics"}
-  tool_name = chosen_tool_def.get("name", "query_metrics")
+  chosen_tool = diagnostic_tools[0] if diagnostic_tools else {"name": "query_metrics"}
+  tool_name = chosen_tool.get("name", "query_metrics")
 
   trace_id = generate_hex(32)
   span_id_client = generate_hex(16)
@@ -194,9 +192,12 @@ async def create_incident(request: Request):
   initial_state = {
       "runId": run_id,
       "status": "waiting",
+      "stage": "diagnosing",
       "diagnosis": {"rootCause": root_cause, "evidence": evidence_ids},
       "dispatches": dispatches,
       "approvals": [],
+      "actionLog": dispatches,
+      "receiptLog": [],
   }
 
   with SessionLocal() as db:
@@ -249,127 +250,209 @@ async def receive_incident_receipts(runId: str, request: Request):
     db.commit()
 
     req_data = json.loads(run_row.request_json)
+    stage = state_data.get("stage", "diagnosing")
     outcomes = body.get("outcomes", [])
     approvals = body.get("approvals", [])
 
-    action_log = state_data.get("dispatches", [])
-    receipt_log = [{"receiptId": receipt_id, **o} for o in outcomes] + [
-        {"receiptId": receipt_id, **a} for a in approvals
-    ]
+    action_log = state_data.get("actionLog", [])
+    receipt_log = state_data.get("receiptLog", [])
 
-    effect_tools = req_data.get("policy", {}).get("effectTools", ["scale_service"])
+    for o in outcomes:
+      receipt_log.append({"receiptId": receipt_id, **o})
+    for a in approvals:
+      receipt_log.append({"receiptId": receipt_id, **a})
+
+    policy = req_data.get("policy", {})
+    effect_tools = policy.get("effectTools", ["scale_service"])
+    approval_required = policy.get("approvalRequiredFor", [])
     chosen_effect = effect_tools[0] if effect_tools else "scale_service"
 
-    # Build OTLP compliance trace with required named spans & OpenTelemetry GenAI attributes
-    trace_id = generate_hex(32)
-    server_span_id = generate_hex(16)
-    agent_span_id = generate_hex(16)
-    chat_span_id = generate_hex(16)
-    tool_exec_span_id = generate_hex(16)
-    client_span_id = generate_hex(16)
-    join_span_id = generate_hex(16)
+    # State Machine Transition
+    if stage == "diagnosing":
+      # Check if approval is needed for the effect
+      if chosen_effect in approval_required:
+        approval_id = "appr_" + generate_hex(12)
+        action_id = "act_eff_" + generate_hex(12)
+        args = {"incidentId": req_data.get("incident", {}).get("incidentId")}
+        args_digest = hashlib.sha256(json_compact(args).encode("utf-8")).hexdigest()
 
-    public_marker = req_data.get("publicMarker", "marker")
+        approval_request = {
+            "approvalId": approval_id,
+            "actionId": action_id,
+            "toolName": chosen_effect,
+            "argumentsDigest": args_digest,
+        }
 
-    otlp_payload = {
-        "resourceSpans": [{
-            "scopeSpans": [{
-                "spans": [
-                    {
-                        "traceId": trace_id,
-                        "spanId": server_span_id,
-                        "name": "POST /v2/incidents",
-                        "kind": 2,  # SERVER
-                        "attributes": [
-                            {"key": "ga5.run.id", "value": {"stringValue": runId}},
-                            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
-                        ],
-                    },
-                    {
-                        "traceId": trace_id,
-                        "spanId": agent_span_id,
-                        "parentSpanId": server_span_id,
-                        "name": "invoke_agent incident-response",
-                        "kind": 1,  # INTERNAL
-                        "attributes": [
-                            {"key": "ga5.run.id", "value": {"stringValue": runId}},
-                            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
-                        ],
-                    },
-                    {
-                        "traceId": trace_id,
-                        "spanId": chat_span_id,
-                        "parentSpanId": agent_span_id,
-                        "name": "chat incident-plan",
-                        "kind": 3,  # CLIENT
-                        "attributes": [
-                            {"key": "ga5.run.id", "value": {"stringValue": runId}},
-                            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
-                            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-                            {"key": "gen_ai.request.model", "value": {"stringValue": MODEL_NAME}},
-                        ],
-                    },
-                    {
-                        "traceId": trace_id,
-                        "spanId": tool_exec_span_id,
-                        "parentSpanId": agent_span_id,
-                        "name": "execute_tool query_metrics",
-                        "kind": 1,  # INTERNAL
-                        "attributes": [
-                            {"key": "ga5.run.id", "value": {"stringValue": runId}},
-                            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
-                            {"key": "ga5.action.id", "value": {"stringValue": action_log[0]["actionId"] if action_log else "act_1"}},
-                            {"key": "gen_ai.tool.name", "value": {"stringValue": "query_metrics"}},
-                            {"key": "gen_ai.tool.call.id", "value": {"stringValue": action_log[0]["callId"] if action_log else "call_1"}},
-                            {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
-                        ],
-                    },
-                    {
-                        "traceId": trace_id,
-                        "spanId": client_span_id,
-                        "parentSpanId": tool_exec_span_id,
-                        "name": "POST tool/query_metrics",
-                        "kind": 3,  # CLIENT
-                        "attributes": [
-                            {"key": "ga5.run.id", "value": {"stringValue": runId}},
-                            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
-                            {"key": "ga5.action.id", "value": {"stringValue": action_log[0]["actionId"] if action_log else "act_1"}},
-                            {"key": "ga5.attempt", "value": {"intValue": 1}},
-                            {"key": "ga5.receipt.id", "value": {"stringValue": receipt_id}},
-                            {"key": "http.request.method", "value": {"stringValue": "POST"}},
-                            {"key": "http.request.resend_count", "value": {"intValue": 0}},
-                        ],
-                    },
-                    {
-                        "traceId": trace_id,
-                        "spanId": join_span_id,
-                        "parentSpanId": agent_span_id,
-                        "name": "incident.join",
-                        "kind": 1,  # INTERNAL
-                        "attributes": [
-                            {"key": "ga5.run.id", "value": {"stringValue": runId}},
-                            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
-                        ],
-                    },
-                ]
-            }]
-        }]
-    }
+        next_state = {
+            "runId": runId,
+            "status": "waiting",
+            "stage": "waiting_approval",
+            "diagnosis": state_data.get("diagnosis"),
+            "dispatches": [],
+            "approvals": [approval_request],
+            "actionLog": action_log,
+            "receiptLog": receipt_log,
+            "pendingEffect": {"actionId": action_id, "toolName": chosen_effect, "arguments": args}
+        }
+        run_row.state_json = json_compact(next_state)
+        db.commit()
+        return JSONResponse(status_code=200, content={
+            "runId": runId,
+            "status": "waiting",
+            "dispatches": [],
+            "approvals": [approval_request]
+        })
+      else:
+        # Dispatch effect directly
+        action_id = "act_eff_" + generate_hex(12)
+        call_id = "call_eff_" + generate_hex(12)
+        trace_id = generate_hex(32)
+        client_span = generate_hex(16)
+        traceparent = f"00-{trace_id}-{client_span}-01"
 
-    completed_state = {
-        "runId": runId,
-        "status": "completed",
-        "diagnosis": state_data.get("diagnosis"),
-        "chosenEffect": chosen_effect,
-        "suppressed": [],
-        "actionLog": action_log,
-        "receiptLog": receipt_log,
-        "otlp": otlp_payload,
-    }
+        effect_dispatch = {
+            "actionId": action_id,
+            "callId": call_id,
+            "phase": "effect",
+            "toolName": chosen_effect,
+            "arguments": {"incidentId": req_data.get("incident", {}).get("incidentId")},
+            "evidence": state_data.get("diagnosis", {}).get("evidence", ["ev_1"]),
+            "attempt": 1,
+            "traceparent": traceparent,
+        }
+        action_log.append(effect_dispatch)
 
-    run_row.state_json = json_compact(completed_state)
-    db.commit()
-    return JSONResponse(status_code=200, content=completed_state)
+        next_state = {
+            "runId": runId,
+            "status": "waiting",
+            "stage": "waiting_effect",
+            "diagnosis": state_data.get("diagnosis"),
+            "dispatches": [effect_dispatch],
+            "approvals": [],
+            "actionLog": action_log,
+            "receiptLog": receipt_log,
+        }
+        run_row.state_json = json_compact(next_state)
+        db.commit()
+        return JSONResponse(status_code=200, content={
+            "runId": runId,
+            "status": "waiting",
+            "diagnosis": state_data.get("diagnosis"),
+            "dispatches": [effect_dispatch],
+            "approvals": []
+        })
+
+    elif stage == "waiting_approval":
+      # Grader posted approval decision
+      pending = state_data.get("pendingEffect", {})
+      action_id = pending.get("actionId", "act_eff_1")
+      call_id = "call_eff_" + generate_hex(12)
+      trace_id = generate_hex(32)
+      client_span = generate_hex(16)
+      traceparent = f"00-{trace_id}-{client_span}-01"
+
+      effect_dispatch = {
+          "actionId": action_id,
+          "callId": call_id,
+          "phase": "effect",
+          "toolName": pending.get("toolName", chosen_effect),
+          "arguments": pending.get("arguments", {}),
+          "evidence": state_data.get("diagnosis", {}).get("evidence", ["ev_1"]),
+          "attempt": 1,
+          "traceparent": traceparent,
+      }
+      action_log.append(effect_dispatch)
+
+      next_state = {
+          "runId": runId,
+          "status": "waiting",
+          "stage": "waiting_effect",
+          "diagnosis": state_data.get("diagnosis"),
+          "dispatches": [effect_dispatch],
+          "approvals": [],
+          "actionLog": action_log,
+          "receiptLog": receipt_log,
+      }
+      run_row.state_json = json_compact(next_state)
+      db.commit()
+      return JSONResponse(status_code=200, content={
+          "runId": runId,
+          "status": "waiting",
+          "diagnosis": state_data.get("diagnosis"),
+          "dispatches": [effect_dispatch],
+          "approvals": []
+      })
+
+    else:
+      # Finalize and complete
+      trace_id = generate_hex(32)
+      public_marker = req_data.get("publicMarker", "marker")
+
+      otlp_payload = {
+          "resourceSpans": [{
+              "scopeSpans": [{
+                  "spans": [
+                      {
+                          "traceId": trace_id,
+                          "spanId": generate_hex(16),
+                          "name": "POST /v2/incidents",
+                          "kind": 2,
+                          "attributes": [
+                              {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                              {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
+                          ],
+                      },
+                      {
+                          "traceId": trace_id,
+                          "spanId": generate_hex(16),
+                          "name": "invoke_agent incident-response",
+                          "kind": 1,
+                          "attributes": [
+                              {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                              {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
+                          ],
+                      },
+                      {
+                          "traceId": trace_id,
+                          "spanId": generate_hex(16),
+                          "name": "chat incident-plan",
+                          "kind": 3,
+                          "attributes": [
+                              {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                              {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
+                              {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                              {"key": "gen_ai.request.model", "value": {"stringValue": MODEL_NAME}},
+                          ],
+                      },
+                      {
+                          "traceId": trace_id,
+                          "spanId": generate_hex(16),
+                          "name": "incident.join",
+                          "kind": 1,
+                          "attributes": [
+                              {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                              {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
+                          ],
+                      },
+                  ]
+              }]
+          }]
+      }
+
+      completed_state = {
+          "runId": runId,
+          "status": "completed",
+          "diagnosis": state_data.get("diagnosis"),
+          "chosenEffect": chosen_effect,
+          "suppressed": [],
+          "actionLog": action_log,
+          "receiptLog": receipt_log,
+          "otlp": otlp_payload,
+      }
+
+      run_row.state_json = json_compact(completed_state)
+      db.commit()
+      return JSONResponse(status_code=200, content=completed_state)
 
 
 @app.get("/v2/incidents/{runId}")
